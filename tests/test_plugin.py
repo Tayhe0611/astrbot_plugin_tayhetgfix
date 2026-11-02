@@ -351,18 +351,143 @@ async def exercise():
     assert payload["chat_id"] == -100
     assert payload["rich_message"]["html"].startswith("<table>")
 
+    # A replacement plugin instance takes over global patch ownership. Terminating
+    # the old instance must not remove the replacement's adapter or proxy patches.
+    replacement = plugin.TelegramHardening(
+        types.SimpleNamespace(),
+        {
+            "proxy": "http://replacement:7890",
+            "proxy_connect_timeout": 6,
+            "proxy_read_timeout": 8,
+        },
+    )
+    await replacement.initialize()
+    assert replacement.status == "already_applied"
+    assert FakeHTTPXRequest().proxy == "http://replacement:7890"
     await instance.terminate()
+    assert getattr(FakeAdapter, "__tg_hardened__", False)
+    still_active = FakeHTTPXRequest()
+    assert still_active.proxy == "http://replacement:7890"
+    assert still_active.connect_timeout == 6
+    assert still_active.read_timeout == 8
+
+    # A failed, not-yet-active replacement must leave the current owner untouched.
+    failed_replacement = plugin.TelegramHardening(types.SimpleNamespace(), {"proxy": ""})
+    original_anchor_check = plugin._anchor_check
+    plugin._anchor_check = lambda _cls: (_ for _ in ()).throw(RuntimeError("replacement anchor failure"))
+    try:
+        await failed_replacement.initialize()
+    finally:
+        plugin._anchor_check = original_anchor_check
+    assert failed_replacement.status == "skipped_anchor"
+    assert getattr(FakeAdapter, "__tg_hardened__", False)
+    assert FakeHTTPXRequest().proxy == "http://replacement:7890"
+
+    inactive = plugin.TelegramHardening(types.SimpleNamespace(), {"enabled": False})
+    await inactive.initialize()
+    await inactive.terminate()
+    assert getattr(FakeAdapter, "__tg_hardened__", False)
+    assert FakeHTTPXRequest().proxy == "http://replacement:7890"
+
+    # Refreshing the active instance with proxy disabled clears the old proxy;
+    # terminating an inactive/older owner cannot alter another instance's state.
+    replacement.config = {"proxy": "http://stale:7890", "proxy_enabled": False}
+    await replacement.initialize()
+    assert not getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+    assert FakeHTTPXRequest().proxy is None
+    await instance.terminate()
+    assert getattr(FakeAdapter, "__tg_hardened__", False)
+
+    # Re-enable with a proxy, then clear the proxy value while still enabled.
+    replacement.config = {"proxy": "http://re-enabled:7890"}
+    await replacement.initialize()
+    assert FakeHTTPXRequest().proxy == "http://re-enabled:7890"
+    replacement.config = {"proxy": ""}
+    await replacement.initialize()
+    assert not getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+    assert FakeHTTPXRequest().proxy is None
+
+    await replacement.terminate()
     assert not getattr(FakeAdapter, "__tg_hardened__", False)
     assert FakeAdapter._build_application.__name__ == "_build_application"
     assert not hasattr(FakeAdapter, "send_rich_message")
 
-    # terminate() must remove the transport patch so a disabled plugin really
-    # stops touching Telegram traffic.
+    # An anchor failure on a previously active instance must release only that
+    # instance's adapter, package-registry, and proxy state.
+    replacement.config = {"proxy": "http://anchor-failure:7890"}
+    await replacement.initialize()
+    original_anchor_check = plugin._anchor_check
+    plugin._anchor_check = lambda _cls: (_ for _ in ()).throw(RuntimeError("simulated anchor failure"))
+    try:
+        await replacement.initialize()
+    finally:
+        plugin._anchor_check = original_anchor_check
+    assert replacement.status == "skipped_anchor"
+    assert not getattr(FakeAdapter, "__tg_hardened__", False)
     assert not getattr(
         FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
     )
-    restored = FakeHTTPXRequest()
-    assert restored.proxy is None, "proxy injection must be gone after terminate()"
+    assert not hasattr(sys.modules["telegram"], "_cs_extra_handlers")
+
+    # The active owner can transition to enabled=False and cleanly restore state.
+    await replacement.initialize()
+    replacement.config = {"enabled": False}
+    await replacement.initialize()
+    assert replacement.status == "disabled"
+    assert not getattr(FakeAdapter, "__tg_hardened__", False)
+    assert not getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+
+    # Upgrade compatibility: v1.2.1's marked proxy wrapper has no owner field or
+    # adapter-owner marker. Disabling proxy in the new instance must adopt/release it.
+    legacy_owner = plugin.TelegramHardening(
+        types.SimpleNamespace(), {"proxy": "http://legacy-owner:7890"}
+    )
+    await legacy_owner.initialize()
+    legacy_init = FakeHTTPXRequest.__dict__["__init__"]
+    legacy_state = getattr(legacy_init, plugin._PROXY_STATE_MARKER)
+    legacy_state.pop("owner", None)
+    delattr(FakeAdapter, "__tayhetgfix_adapter_owner__")
+
+    # An inactive or failed replacement must not adopt/unpatch that legacy
+    # ownerless wrapper before it has passed adapter validation.
+    failed_legacy_replacement = plugin.TelegramHardening(
+        types.SimpleNamespace(), {"proxy_enabled": False}
+    )
+    original_anchor_check = plugin._anchor_check
+    plugin._anchor_check = lambda _cls: (_ for _ in ()).throw(RuntimeError("legacy replacement failure"))
+    try:
+        await failed_legacy_replacement.initialize()
+    finally:
+        plugin._anchor_check = original_anchor_check
+    assert failed_legacy_replacement.status == "skipped_anchor"
+    assert getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+    assert FakeHTTPXRequest().proxy == "http://legacy-owner:7890"
+    disabled_legacy_replacement = plugin.TelegramHardening(
+        types.SimpleNamespace(), {"enabled": False}
+    )
+    await disabled_legacy_replacement.initialize()
+    assert getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+    assert FakeHTTPXRequest().proxy == "http://legacy-owner:7890"
+
+    upgraded = plugin.TelegramHardening(types.SimpleNamespace(), {"proxy_enabled": False})
+    await upgraded.initialize()
+    assert upgraded.status == "already_applied"
+    assert not getattr(
+        FakeHTTPXRequest.__dict__.get("__init__"), "__tg_hardening_proxy_patch__", False
+    )
+    assert FakeHTTPXRequest().proxy is None
+    await upgraded.terminate()
+    assert not getattr(FakeAdapter, "__tg_hardened__", False)
 
 
 if __name__ == "__main__":

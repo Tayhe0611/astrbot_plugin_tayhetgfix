@@ -24,6 +24,7 @@ import inspect
 import logging
 import os
 import re
+import sys
 from collections.abc import Iterable, Mapping
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -49,7 +50,7 @@ except ImportError:  # pragma: no cover - keeps static tests runnable outside As
 
 
 PLUGIN_NAME = "astrbot_plugin_tayhetgfix"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 ADAPTER_MODULE = "astrbot.core.platform.sources.telegram.tg_adapter"
 TELEGRAM_PACKAGE = "astrbot.core.platform.sources.telegram"
 # None preserves PTB's upstream default (all allowed update types except
@@ -222,7 +223,9 @@ _PROXY_STATE: dict[str, Any] = {
     "proxy": "",
     "connect_timeout": DEFAULT_PROXY_CONNECT_TIMEOUT,
     "read_timeout": DEFAULT_PROXY_READ_TIMEOUT,
+    "owner": None,
 }
+_DIRECT_PROXY_OWNER = "__tayhetgfix_direct_owner__"
 _HTTPX_ORIGINAL_INIT: Any = None
 _PROXY_STATE_MARKER = "__tg_hardening_proxy_state__"
 _PROXY_ORIGINAL_MARKER = "__tg_hardening_original_init__"
@@ -271,18 +274,13 @@ def _install_httpx_proxy_patch(
     proxy: str,
     connect_timeout: float | None,
     read_timeout: float | None,
+    owner: Any = None,
 ) -> bool:
-    """Inject ``proxy`` into every ``HTTPXRequest`` that does not set one itself.
+    """Install or refresh the process-wide proxy using a single owner token."""
 
-    Returns ``True`` when the transport was patched or refreshed.  The patch is
-    installed once per process; later calls only refresh the target proxy so a
-    plugin reload picks up a changed value without stacking wrappers.
-    """
+    global _HTTPX_ORIGINAL_INIT, _PROXY_STATE
 
-    global _HTTPX_ORIGINAL_INIT
-
-    if not proxy:
-        return False
+    owner = _DIRECT_PROXY_OWNER if owner is None else owner
     try:
         request_module = importlib.import_module("telegram.request")
     except Exception:
@@ -294,22 +292,30 @@ def _install_httpx_proxy_patch(
         return False
 
     current_init = request_cls.__dict__.get("__init__", None)
-    if getattr(current_init, _HTTPX_PATCH_MARKER, False):
-        shared_state = getattr(current_init, _PROXY_STATE_MARKER, None)
-        if isinstance(shared_state, dict):
-            shared_state.update(
-                proxy=proxy, connect_timeout=connect_timeout, read_timeout=read_timeout
-            )
+    shared_state = getattr(current_init, _PROXY_STATE_MARKER, None)
+    is_patched = bool(getattr(current_init, _HTTPX_PATCH_MARKER, False))
+    if is_patched and isinstance(shared_state, dict):
+        _PROXY_STATE = shared_state
         original = getattr(current_init, _PROXY_ORIGINAL_MARKER, None)
         if original is not None:
             _HTTPX_ORIGINAL_INIT = original
+        if not proxy:
+            _restore_httpx_proxy_patch(owner)
+            return False
+        shared_state.update(
+            proxy=proxy,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            owner=owner,
+        )
+        _logger_call("info", "[tayhetgfix] 已刷新 Telegram 出站代理: %s", _proxy_log_target(proxy))
         return True
 
-    original_init = request_cls.__init__
+    # A request to clear/release a lease must not unpatch another owner.
+    if not proxy:
+        return False
 
-    # PTB has used both ``proxy`` and ``proxy_url`` over its lifetime. Detect
-    # the live spelling and positional slots instead of assuming one version.
-    positions: dict[str, int] = {}
+    original_init = request_cls.__init__
     try:
         params = [
             name
@@ -325,7 +331,12 @@ def _install_httpx_proxy_patch(
         return False
 
     state = _PROXY_STATE
-    state.update(proxy=proxy, connect_timeout=connect_timeout, read_timeout=read_timeout)
+    state.update(
+        proxy=proxy,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        owner=owner,
+    )
 
     def _already_positional(name: str, args: tuple[Any, ...]) -> bool:
         position = positions.get(name)
@@ -334,17 +345,15 @@ def _install_httpx_proxy_patch(
     @functools.wraps(original_init)
     def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
         target = state.get("proxy") or ""
-        # Presence matters: an explicit None/empty value opts out of the global proxy.
         if target and proxy_param not in kwargs and not _already_positional(proxy_param, args):
             kwargs[proxy_param] = target
-        for key in ("connect_timeout", "read_timeout"):
-            if key in kwargs or _already_positional(key, args):
-                continue
-            if key not in positions:
-                continue
-            value = state.get(key)
-            if value is not None:
-                kwargs[key] = value
+        if target:
+            for key in ("connect_timeout", "read_timeout"):
+                if key in kwargs or _already_positional(key, args) or key not in positions:
+                    continue
+                value = state.get(key)
+                if value is not None:
+                    kwargs[key] = value
         original_init(self, *args, **kwargs)
 
     setattr(patched_init, _HTTPX_PATCH_MARKER, True)
@@ -356,28 +365,65 @@ def _install_httpx_proxy_patch(
     return True
 
 
-def _restore_httpx_proxy_patch() -> None:
-    global _HTTPX_ORIGINAL_INIT
+def _restore_httpx_proxy_patch(owner: Any = None) -> None:
+    """Release the proxy patch only when called by its current owner."""
 
+    global _HTTPX_ORIGINAL_INIT, _PROXY_STATE
+
+    owner = _DIRECT_PROXY_OWNER if owner is None else owner
     try:
         request_module = importlib.import_module("telegram.request")
         request_cls = getattr(request_module, "HTTPXRequest", None)
     except Exception:
         request_cls = None
-    if isinstance(request_cls, type):
-        current_init = request_cls.__dict__.get("__init__", None)
-        if getattr(current_init, _HTTPX_PATCH_MARKER, False):
-            original = (
-                _HTTPX_ORIGINAL_INIT
-                or getattr(current_init, _PROXY_ORIGINAL_MARKER, None)
-            )
-            if original is not None:
-                request_cls.__init__ = original
-            shared_state = getattr(current_init, _PROXY_STATE_MARKER, None)
-            if isinstance(shared_state, dict):
-                shared_state.update(proxy="")
+
+    current_init = (
+        request_cls.__dict__.get("__init__", None)
+        if isinstance(request_cls, type)
+        else None
+    )
+    shared_state = getattr(current_init, _PROXY_STATE_MARKER, None)
+    if isinstance(shared_state, dict):
+        _PROXY_STATE = shared_state
+    state = _PROXY_STATE
+    if state.get("owner") is not owner:
+        return
+
+    if getattr(current_init, _HTTPX_PATCH_MARKER, False):
+        original = getattr(current_init, _PROXY_ORIGINAL_MARKER, None)
+        if original is None:
+            original = _HTTPX_ORIGINAL_INIT
+        if original is not None and isinstance(request_cls, type):
+            request_cls.__init__ = original
+    state.update(proxy="", owner=None)
     _HTTPX_ORIGINAL_INIT = None
-    _PROXY_STATE.update(proxy="")
+
+
+def _configure_httpx_proxy(
+    proxy: str,
+    enabled: bool,
+    owner: Any,
+    previous_owner: Any,
+    connect_timeout: float | None,
+    read_timeout: float | None,
+) -> bool:
+    """Apply proxy settings after the adapter patch has initialized successfully."""
+
+    request_module = sys.modules.get("telegram.request")
+    request_cls = getattr(request_module, "HTTPXRequest", None)
+    current_init = request_cls.__dict__.get("__init__") if isinstance(request_cls, type) else None
+    state = getattr(current_init, _PROXY_STATE_MARKER, None)
+    if getattr(current_init, _HTTPX_PATCH_MARKER, False) and isinstance(state, dict):
+        state_owner = state.get("owner")
+        owns_previous_patch = previous_owner is not None and state_owner is previous_owner
+        is_legacy_unowned_patch = previous_owner is None and state_owner is None
+        if owns_previous_patch or is_legacy_unowned_patch:
+            state["owner"] = owner
+
+    if not enabled or not proxy:
+        _restore_httpx_proxy_patch(owner)
+        return False
+    return _install_httpx_proxy_patch(proxy, connect_timeout, read_timeout, owner=owner)
 
 
 def _astrbot_version() -> str:
@@ -1162,17 +1208,22 @@ def _make_run_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def _install_package_registry(package: Any) -> tuple[Any, bool, Any]:
-    """Install an in-memory registry and return (registry, had_attr, old_value)."""
+def _install_package_registry(package: Any, owner: Any = None) -> tuple[Any, bool, Any]:
+    """Install an in-memory registry and preserve the original package state."""
 
-    old_value = getattr(package, "_cs_extra_handlers", None)
-    had_attr = hasattr(package, "_cs_extra_handlers")
+    state = getattr(package, "__tayhetgfix_registry_state__", None)
+    if not isinstance(state, dict):
+        state = {
+            "had_attr": hasattr(package, "_cs_extra_handlers"),
+            "old_value": getattr(package, "_cs_extra_handlers", None),
+            "owner": owner,
+        }
+        setattr(package, "__tayhetgfix_registry_state__", state)
+
+    had_attr, old_value = state["had_attr"], state["old_value"]
     registry = getattr(package, "__tg_hardening_handler_registry__", None)
     if not isinstance(registry, list):
-        if isinstance(old_value, list):
-            registry = old_value
-        else:
-            registry = _HANDLER_REGISTRY
+        registry = old_value if isinstance(old_value, list) else _HANDLER_REGISTRY
         setattr(package, "__tg_hardening_handler_registry__", registry)
 
     # Merge helpers registered before initialize(), preserving identity so old
@@ -1184,10 +1235,27 @@ def _install_package_registry(package: Any) -> tuple[Any, bool, Any]:
     return registry, had_attr, old_value
 
 
-def _restore_package_registry(package: Any, previous: tuple[bool, Any] | None) -> None:
-    if previous is None:
+def _claim_package_registry(package: Any, owner: Any) -> None:
+    state = getattr(package, "__tayhetgfix_registry_state__", None)
+    if isinstance(state, dict):
+        state["owner"] = owner
+
+
+def _restore_package_registry(
+    package: Any,
+    previous: tuple[bool, Any] | None,
+    owner: Any = None,
+) -> None:
+    state = getattr(package, "__tayhetgfix_registry_state__", None)
+    if isinstance(state, dict):
+        if state.get("owner") is not owner:
+            return
+        had_attr, old_value = state["had_attr"], state["old_value"]
+    elif previous is not None:
+        had_attr, old_value = previous
+    else:
         return
-    had_attr, old_value = previous
+
     if had_attr:
         setattr(package, "_cs_extra_handlers", old_value)
     else:
@@ -1195,10 +1263,9 @@ def _restore_package_registry(package: Any, previous: tuple[bool, Any] | None) -
             delattr(package, "_cs_extra_handlers")
         except AttributeError:
             pass
-    # Only remove our marker if it still points at the registry we installed.
-    if hasattr(package, "__tg_hardening_handler_registry__"):
+    for marker in ("__tg_hardening_handler_registry__", "__tayhetgfix_registry_state__"):
         try:
-            delattr(package, "__tg_hardening_handler_registry__")
+            delattr(package, marker)
         except AttributeError:
             pass
 
@@ -1249,6 +1316,7 @@ class TelegramHardening(Star):
         self._adapter_cls: type | None = None
         self._package: Any = None
         self._previous_package_registry: tuple[bool, Any] | None = None
+        self._proxy_owner = getattr(self, "_proxy_owner", None) or object()
         self.status = "not_initialized"
         self.version = "unknown"
 
@@ -1256,10 +1324,12 @@ class TelegramHardening(Star):
         enabled = _as_bool(_read_config(self.config, "enabled", True), True)
         self.version = _astrbot_version()
         if not enabled:
+            self._deactivate()
             self.status = "disabled"
             _logger_call("info", "[tayhetgfix] 插件已禁用")
             return
         if _incompatible_version(self.config, self.version):
+            self._deactivate()
             self.status = "skipped_version"
             _logger_call(
                 "warning",
@@ -1276,6 +1346,10 @@ class TelegramHardening(Star):
                 raise _PatchError("TelegramPlatformAdapter class not found")
             _anchor_check(adapter_cls)
         except Exception as exc:
+            # If this instance was already active, release only its own patch
+            # state. A failed replacement has no ownership and must not disturb
+            # the currently active instance.
+            self._deactivate()
             self.status = "skipped_anchor"
             _logger_call(
                 "warning",
@@ -1285,7 +1359,8 @@ class TelegramHardening(Star):
             )
             return
 
-        registry, had_attr, old_value = _install_package_registry(package)
+        previous_adapter_owner = getattr(adapter_cls, "__tayhetgfix_adapter_owner__", None)
+        registry, had_attr, old_value = _install_package_registry(package, self._proxy_owner)
         self._package = package
         self._previous_package_registry = (had_attr, old_value)
         allowed = _allowed_updates(_read_config(self.config, "allowed_updates", None))
@@ -1293,20 +1368,9 @@ class TelegramHardening(Star):
         # Telegram 出站代理必须显式注入：AstrBot 只导出环境变量，而 PTB 的
         # HTTPXRequest 在部分 httpx 版本下不会读取它们，表现为轮询 ConnectError。
         proxy = _resolve_proxy(self.config)
+        proxy_enabled = _as_bool(_read_config(self.config, "proxy_enabled", True), True)
         proxy_applied = False
-        if _as_bool(_read_config(self.config, "proxy_enabled", True), True) and proxy:
-            proxy_applied = _install_httpx_proxy_patch(
-                proxy,
-                _proxy_timeout(
-                    _read_config(self.config, "proxy_connect_timeout", DEFAULT_PROXY_CONNECT_TIMEOUT),
-                    DEFAULT_PROXY_CONNECT_TIMEOUT,
-                ),
-                _proxy_timeout(
-                    _read_config(self.config, "proxy_read_timeout", DEFAULT_PROXY_READ_TIMEOUT),
-                    DEFAULT_PROXY_READ_TIMEOUT,
-                ),
-            )
-        elif not proxy:
+        if not proxy:
             _logger_call(
                 "info",
                 "[tayhetgfix] 未配置 proxy 且环境中没有 http_proxy/https_proxy，"
@@ -1349,8 +1413,25 @@ class TelegramHardening(Star):
             ):
                 needs_refresh = True
             if not needs_refresh:
+                _claim_package_registry(package, self._proxy_owner)
+                proxy_applied = _configure_httpx_proxy(
+                    proxy,
+                    proxy_enabled,
+                    self._proxy_owner,
+                    previous_adapter_owner,
+                    _proxy_timeout(
+                        _read_config(self.config, "proxy_connect_timeout", DEFAULT_PROXY_CONNECT_TIMEOUT),
+                        DEFAULT_PROXY_CONNECT_TIMEOUT,
+                    ),
+                    _proxy_timeout(
+                        _read_config(self.config, "proxy_read_timeout", DEFAULT_PROXY_READ_TIMEOUT),
+                        DEFAULT_PROXY_READ_TIMEOUT,
+                    ),
+                )
+                runtime["proxy_applied"] = proxy_applied
                 existing["runtime"] = runtime
                 setattr(adapter_cls, "__tg_hardened__", True)
+                setattr(adapter_cls, "__tayhetgfix_adapter_owner__", self._proxy_owner)
                 self._adapter_cls = adapter_cls
                 self.status = "already_applied"
                 _logger_call(
@@ -1367,7 +1448,7 @@ class TelegramHardening(Star):
         if not all(inspect.iscoroutinefunction(originals[name]) for name in ("run", "message_handler")):
             self.status = "skipped_anchor"
             _logger_call("warning", "[tayhetgfix] run/message_handler 不是 async 方法，跳过补丁")
-            _restore_package_registry(package, self._previous_package_registry)
+            _restore_package_registry(package, self._previous_package_registry, self._proxy_owner)
             self._previous_package_registry = None
             return
 
@@ -1415,10 +1496,27 @@ class TelegramHardening(Star):
                         pass
                 else:
                     setattr(adapter_cls, name, original)
-            _restore_package_registry(package, self._previous_package_registry)
+            _restore_package_registry(package, self._previous_package_registry, self._proxy_owner)
             self._previous_package_registry = None
             raise
 
+        _claim_package_registry(package, self._proxy_owner)
+        proxy_applied = _configure_httpx_proxy(
+            proxy,
+            proxy_enabled,
+            self._proxy_owner,
+            previous_adapter_owner,
+            _proxy_timeout(
+                _read_config(self.config, "proxy_connect_timeout", DEFAULT_PROXY_CONNECT_TIMEOUT),
+                DEFAULT_PROXY_CONNECT_TIMEOUT,
+            ),
+            _proxy_timeout(
+                _read_config(self.config, "proxy_read_timeout", DEFAULT_PROXY_READ_TIMEOUT),
+                DEFAULT_PROXY_READ_TIMEOUT,
+            ),
+        )
+        runtime["proxy_applied"] = proxy_applied
+        setattr(adapter_cls, "__tayhetgfix_adapter_owner__", self._proxy_owner)
         self._adapter_cls = adapter_cls
         self.status = "applied"
         _logger_call(
@@ -1430,12 +1528,27 @@ class TelegramHardening(Star):
             _proxy_log_target(proxy) if proxy else "直连",
         )
 
-    async def terminate(self) -> None:
-        if self._adapter_cls is not None:
-            _unpatch_adapter(self._adapter_cls)
+    def _deactivate(self) -> None:
+        adapter_cls = self._adapter_cls
+        if adapter_cls is not None:
+            current_owner = getattr(adapter_cls, "__tayhetgfix_adapter_owner__", None)
+            if current_owner is self._proxy_owner:
+                _unpatch_adapter(adapter_cls)
+                try:
+                    delattr(adapter_cls, "__tayhetgfix_adapter_owner__")
+                except AttributeError:
+                    pass
+            _restore_httpx_proxy_patch(self._proxy_owner)
+            self._adapter_cls = None
+        else:
+            _restore_httpx_proxy_patch(self._proxy_owner)
         if self._package is not None:
-            _restore_package_registry(self._package, self._previous_package_registry)
-        _restore_httpx_proxy_patch()
+            _restore_package_registry(self._package, self._previous_package_registry, self._proxy_owner)
+            self._package = None
+            self._previous_package_registry = None
+
+    async def terminate(self) -> None:
+        self._deactivate()
         self.status = "terminated"
         _logger_call("info", "[tayhetgfix] 已还原 Telegram 适配器补丁")
 

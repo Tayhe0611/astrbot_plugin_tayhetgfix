@@ -21,7 +21,6 @@ import asyncio
 import functools
 import importlib
 import inspect
-import logging
 import os
 import re
 import sys
@@ -29,28 +28,12 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-try:  # AstrBot is available when the plugin is loaded.
-    from astrbot.api import logger
-    from astrbot.api.star import Context, Star, register
-except ImportError:  # pragma: no cover - keeps static tests runnable outside AstrBot.
-    logger = logging.getLogger("astrbot_plugin_tayhetgfix")
-
-    class Context:  # type: ignore[no-redef]
-        pass
-
-    class Star:  # type: ignore[no-redef]
-        def __init__(self, context: Any) -> None:
-            self.context = context
-
-    def register(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
-        def decorator(cls: type) -> type:
-            return cls
-
-        return decorator
+from astrbot.api import logger
+from astrbot.api.star import Context, Star, register
 
 
 PLUGIN_NAME = "astrbot_plugin_tayhetgfix"
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.2.3"
 ADAPTER_MODULE = "astrbot.core.platform.sources.telegram.tg_adapter"
 TELEGRAM_PACKAGE = "astrbot.core.platform.sources.telegram"
 # None preserves PTB's upstream default (all allowed update types except

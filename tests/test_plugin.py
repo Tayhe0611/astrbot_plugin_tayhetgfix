@@ -10,6 +10,44 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+
+class FakeLogger:
+    def __getattr__(self, _name):
+        return lambda *_args, **_kwargs: None
+
+
+def install_fake_astrbot_api():
+    astrbot = types.ModuleType("astrbot")
+    astrbot.__path__ = []
+    astrbot.__version__ = "4.28.0"
+    api = types.ModuleType("astrbot.api")
+    api.__path__ = []
+    api.logger = FakeLogger()
+    star_module = types.ModuleType("astrbot.api.star")
+
+    class FakeContext:
+        pass
+
+    class FakeStar:
+        def __init__(self, context):
+            self.context = context
+
+    def fake_register(*_args, **_kwargs):
+        return lambda cls: cls
+
+    star_module.Context = FakeContext
+    star_module.Star = FakeStar
+    star_module.register = fake_register
+    astrbot.api = api
+    api.star = star_module
+    sys.modules.update({
+        "astrbot": astrbot,
+        "astrbot.api": api,
+        "astrbot.api.star": star_module,
+    })
+
+
+install_fake_astrbot_api()
 import main as plugin  # noqa: E402
 
 

@@ -1,0 +1,68 @@
+{
+  "enabled": {
+    "description": "启用 Telegram 运行时补丁",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不修改 AstrBot 核心；如果之前已加载过补丁，请重载插件或重启 AstrBot 以执行 terminate。"
+  },
+  "proxy_enabled": {
+    "description": "为 Telegram 显式注入出站代理",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会给 python-telegram-bot 的 HTTPXRequest 显式传入代理。AstrBot 只导出 http_proxy 环境变量，部分 httpx 版本下 PTB 不读取它，表现为轮询 ConnectError。"
+  },
+  "proxy": {
+    "description": "Telegram 代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动读取 AstrBot 的 http_proxy/https_proxy 环境变量。示例：http://172.18.0.1:7890（Docker 容器访问宿主机 mihomo 的常用地址）。"
+  },
+  "proxy_connect_timeout": {
+    "description": "代理连接超时（秒）",
+    "type": "float",
+    "default": 20,
+    "hint": "经代理访问 Telegram 时建立连接的超时时间。"
+  },
+  "proxy_read_timeout": {
+    "description": "代理读取超时（秒）",
+    "type": "float",
+    "default": 20,
+    "hint": "经代理访问 Telegram 时等待响应的超时时间。代理链路较慢时可调大。"
+  },
+  "allowed_updates": {
+    "description": "Telegram polling 接收的更新类型",
+    "type": "string",
+    "default": "",
+    "hint": "逗号或空格分隔。留空时保留 python-telegram-bot 的默认行为；填写后仅接收列出的更新类型。"
+  },
+  "max_restart": {
+    "description": "run 外层崩溃后的最大重启次数",
+    "type": "int",
+    "default": 3,
+    "hint": "只限制插件外层捕获到的异常；AstrBot 自身已处理的轮询重试仍由核心逻辑负责。0 表示不做外层重启。"
+  },
+  "restart_delay": {
+    "description": "崩溃后重建前的等待秒数",
+    "type": "float",
+    "default": 1,
+    "hint": "避免异常时紧密重启；可设为 0。"
+  },
+  "incompatible_versions": {
+    "description": "跳过补丁的 AstrBot 版本",
+    "type": "string",
+    "default": "",
+    "hint": "逗号分隔；支持精确版本、版本前缀（例如 4.28）和通配符（例如 4.28.*）。锚点检查失败时插件也会自动跳过。"
+  },
+  "media_download_fallback": {
+    "description": "媒体下载失败时保留消息并添加空媒体占位",
+    "type": "bool",
+    "default": true,
+    "hint": "覆盖语音、音频、图片、贴纸、文档、视频和视频笔记；关闭后恢复核心行为。"
+  },
+  "rich_message_fallback": {
+    "description": "从 Telegram rich_message 提取入站纯文本",
+    "type": "bool",
+    "default": true,
+    "hint": "兼容 text 字符串、嵌套 blocks、table cells 和 api_kwargs；关闭后不做富文本兜底。"
+  }
+}

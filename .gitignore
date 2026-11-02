@@ -1,0 +1,14 @@
+# Python runtime/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local caches and diagnostic/source snapshots
+.uv-cache/
+_tgdiag_inspect/
+*.bak_*
+*.bak_v*
+
+# Historical release archives are not source inputs
+astrbot_plugin_tg_hardening_v*.zip
+astrbot_plugin_tg_hardening_v*.tgz

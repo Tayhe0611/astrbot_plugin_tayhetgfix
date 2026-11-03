@@ -1,7 +1,7 @@
 name: astrbot_plugin_tayhetgfix
 display_name: 🛡️ Telegram 适配器自愈补丁
 desc: 通过幂等、可卸载的运行时 monkeypatch 增强 AstrBot Telegram 适配器（含出站代理注入），避免直接修改核心文件。
-version: 1.2.3
+version: 1.2.4
 author: tangshusheng
 repo: https://github.com/tangshusheng/astrbot_plugin_tayhetgfix
 astrbot_version: ">=4.19.0"

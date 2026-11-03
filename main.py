@@ -33,7 +33,7 @@ from astrbot.api.star import Context, Star, register
 
 
 PLUGIN_NAME = "astrbot_plugin_tayhetgfix"
-PLUGIN_VERSION = "1.2.3"
+PLUGIN_VERSION = "1.2.4"
 ADAPTER_MODULE = "astrbot.core.platform.sources.telegram.tg_adapter"
 TELEGRAM_PACKAGE = "astrbot.core.platform.sources.telegram"
 # None preserves PTB's upstream default (all allowed update types except

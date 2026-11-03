@@ -1,97 +1,83 @@
-# astrbot_plugin_tayhetgfix
+<h1 align="center">Telegram 适配器自愈补丁</h1>
 
-这是一个**不修改 AstrBot 安装文件**的 Telegram 适配器运行时补丁插件。
+<p align="center">
+  <strong>为 AstrBot Telegram 适配器提供可卸载的运行时兼容补丁、媒体容错与出站代理注入。</strong>
+</p>
 
-## 功能
+<p align="center">
+  <a href="https://github.com/tangshusheng/astrbot_plugin_tayhetgfix/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/tangshusheng/astrbot_plugin_tayhetgfix?style=for-the-badge&label=release" /></a>
+  <a href="https://github.com/tangshusheng/astrbot_plugin_tayhetgfix/blob/main/LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue?style=for-the-badge" /></a>
+  <a href="https://github.com/Soulter/AstrBot"><img alt="AstrBot plugin" src="https://img.shields.io/badge/AstrBot-plugin-00A86B?style=for-the-badge" /></a>
+  <a href="https://github.com/tangshusheng/astrbot_plugin_tayhetgfix/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/tangshusheng/astrbot_plugin_tayhetgfix?style=for-the-badge&color=gold" /></a>
+</p>
 
-插件在 AstrBot 插件初始化阶段导入 `TelegramPlatformAdapter`，在平台实例化前对核心方法做幂等包装：
+本插件面向 AstrBot Telegram 适配器，在不修改 AstrBot 安装文件的前提下，提供幂等、可卸载的运行时兼容补丁。适用于希望改善 Telegram 轮询稳定性、媒体转换容错及富文本消息处理的部署。
 
-1. `_build_application`：保留核心注册逻辑后，补注册运行时 handler，并在应用重建后重新安装 polling 守卫。
-2. `run`：外层捕获未处理异常，按 `max_restart` 重建 application 后重试。
-3. `message_handler`：最后一道异常隔离，单条消息转换/处理异常不会直接冒泡到 Telegram 适配器。
-4. `convert_message`（核心存在且为 async 时）：
-   - 语音、音频、图片、贴纸、文档、视频、视频笔记下载失败时保留消息并添加空媒体占位；
-   - 核心在 `file_path is None` 时直接返回的文档/视频也会补空占位；
-   - 解析入站 `rich_message`，兼容字符串 `text`、嵌套 `blocks`、表格 `cells`、`api_kwargs`，并转换为可处理的纯文本。
-5. 如果核心没有 `send_rich_message`，插件会注入该方法，复用适配器已有 bot client 调用 `sendRichMessage`；如果核心已经提供，则保留核心实现。
-6. **出站代理注入**（v1.2.0 新增）：给 `telegram.request.HTTPXRequest` 显式传入代理，解决墙内轮询 `httpx.ConnectError`；支持 PTB 的 `proxy` 与旧版 `proxy_url` 参数形式。
+## 目录
 
-polling 默认保留 python-telegram-bot 自身的 `allowed_updates` 行为；只有显式配置更新类型时才覆盖。所有补丁都带有锚点检查、版本跳过、幂等标记，并在 `terminate()` 中恢复原始方法或删除插件注入的方法。
+- [功能一览](#功能一览)
+- [安装与快速配置](#安装与快速配置)
+- [常用配置](#常用配置)
+- [代理配置](#代理配置)
+- [handler 扩展](#handler-扩展)
+- [限制与排障](#限制与排障)
+- [作者与许可证](#作者与许可证)
 
-## 为什么需要出站代理注入
+## 功能一览
 
-AstrBot 的 `core_lifecycle.py` 只会把 `http_proxy` 配置写成进程环境变量：
+| 能力 | 说明 |
+| --- | --- |
+| **Telegram 运行时兼容** | 在平台实例化前对 Telegram 适配器方法进行锚点检查后再包装；不直接修改 AstrBot 核心文件。 |
+| **轮询稳定性** | 对未处理的 `run()` 异常提供有限次数的重建重试，并在 application 重建后恢复 polling 守卫。 |
+| **消息异常隔离** | 为单条消息处理增加异常边界，避免个别转换/处理异常直接中断适配器。 |
+| **媒体下载容错** | 语音、音频、图片、贴纸、文档、视频和视频笔记下载失败时，尽量保留消息并补空媒体占位。 |
+| **入站富文本兼容** | 递归提取 `rich_message` 文本，兼容嵌套 blocks、表格 cells、`to_dict()` 与 `api_kwargs`。 |
+| **PTB handler 注册** | 提供公共 helper，供其他插件向 Telegram bot 注册额外的 python-telegram-bot handler。 |
+| **出站代理注入** | 为新建的 `HTTPXRequest` 显式补充代理；兼容 PTB 的 `proxy` 与旧版 `proxy_url` 参数，并避免覆盖调用方显式传参。 |
 
-```python
-os.environ["https_proxy"] = proxy_config
-os.environ["http_proxy"] = proxy_config
-```
+补丁支持幂等安装与 `terminate()` 清理；遇到不兼容版本或关键方法锚点变化时会跳过并记录日志。`allowed_updates` 默认保持 python-telegram-bot 自身行为，只有填写配置时才覆盖。
 
-但 `python-telegram-bot` 的 `HTTPXRequest` 是否读取这些变量，取决于底层 httpx 的 `trust_env` 行为。在部分版本组合下它并不生效，结果就是：
+## 安装与快速配置
 
-```text
-telegram.error.NetworkError: httpx.ConnectError:
-  Telegram polling request failed
-  Telegram polling crashed with exception ... Retrying in 5.0s
-```
+1. 在 AstrBot 插件管理中搜索 **Telegram 适配器自愈补丁** 安装；或从[最新 Release](https://github.com/tangshusheng/astrbot_plugin_tayhetgfix/releases/latest)下载 ZIP 后导入。
+2. 启用插件并检查配置；需要代理时确认 `proxy_enabled` 已开启，并设置可从 AstrBot 容器访问的代理地址，或留空使用 AstrBot 的 `http_proxy` / `https_proxy` 环境变量。
+3. 保存后重载插件。首次启用或修改代理后，建议重启 AstrBot，使 Telegram 平台重新创建 HTTP 请求对象并应用代理。
 
-而 mihomo 侧**完全看不到**任何 telegram 流量——请求在容器内就失败了，根本没到代理。
+## 常用配置
 
-本插件在 `HTTPXRequest.__init__` 上做一次幂等包装，为每个新建的请求对象显式补上 `proxy`（以及可选超时）。只注入调用方**没有**提供的参数，且同时考虑位置参数与关键字参数，因此不会覆盖显式配置、也不会触发 `got multiple values`。
+| 配置项 | 默认值 | 用途 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关；关闭时清理本插件持有的运行时补丁。 |
+| `proxy_enabled` | `true` | 是否向新建的 Telegram `HTTPXRequest` 注入代理。 |
+| `proxy` | 空 | 代理地址；留空时读取 AstrBot 的 `http_proxy` / `https_proxy` 环境变量。 |
+| `proxy_connect_timeout` | `20` 秒 | 代理连接超时。 |
+| `proxy_read_timeout` | `20` 秒 | 代理读取超时。 |
+| `allowed_updates` | 空 | 留空保持 PTB 默认行为；填写逗号或空格分隔的更新类型后，仅接收列出的更新。 |
+| `max_restart` | `3` | 插件包装层捕获到 `run()` 异常后的最大重启次数。 |
+| `restart_delay` | `1` 秒 | 重建 application 前的等待时间。 |
+| `media_download_fallback` | `true` | 媒体下载失败时保留消息并添加空占位。 |
+| `rich_message_fallback` | `true` | 从入站 `rich_message` 提取纯文本。 |
+| `incompatible_versions` | 空 | 跳过补丁的 AstrBot 版本；支持 `4.28`、`4.28.*` 等写法。 |
 
-## 安装
+## 代理配置
 
-将本目录复制为：
+AstrBot 通常将 `http_proxy` / `https_proxy` 写入进程环境变量，但部分 `python-telegram-bot` 与 httpx 版本组合不一定会按预期读取这些变量。本插件会在 `HTTPXRequest.__init__` 上做幂等包装，为新创建的请求对象显式补代理和可选超时；不会覆盖调用方已传入的代理，也会处理位置参数与关键字参数冲突。
 
-```text
-data/plugins/astrbot_plugin_tayhetgfix/
-```
+常见 Docker 部署地址示例：
 
-然后在 AstrBot WebUI 中启用插件并重载。插件应在 Telegram 平台实例化之前加载；日志中会打印：
+| 部署方式 | 代理地址示例 |
+| --- | --- |
+| Docker 容器访问宿主机 mihomo | `http://172.18.0.1:7890`（以实际容器网关为准） |
+| 默认 docker0 网桥 | `http://172.17.0.1:7890` |
+| mihomo 与 AstrBot 在同一网络命名空间 | `http://127.0.0.1:7890` |
 
-```text
-[tayhetgfix] 补丁已应用 (version=..., allowed_updates=..., max_restart=..., proxy=http://host:port)
-[tayhetgfix] 已注入 Telegram 出站代理: http://host:port (认证信息已隐藏)
-```
+> Docker Compose 网络重建后网关地址可能变化。请确认 mihomo 监听地址、防火墙规则和容器网段；不要在公开网络中无保护地暴露代理端口。
 
-如果版本不兼容或目标方法锚点发生变化，插件会打印 warning 并跳过，不会直接修改文件。
+日志仅显示代理 scheme、主机和端口，认证信息会隐藏。SOCKS5 代理需要在运行环境安装 `python-telegram-bot[socks]` 对应依赖。
 
-### 重要：必须重启 AstrBot，而不只是重载插件
+## handler 扩展
 
-代理补丁作用在 `HTTPXRequest.__init__` 上，只对**之后新建**的请求对象生效。如果 Telegram 平台已经在运行，它手里的 bot 请求对象是旧的，不会自动获得代理。
-
-所以首次启用后请**重启容器/进程**：
-
-```bash
-docker restart astrbot
-```
-
-## 配置
-
-- `enabled`：总开关。
-- `proxy_enabled`：是否注入出站代理，默认开启。
-- `proxy`：代理地址。**留空则自动读取** AstrBot 的 `http_proxy`/`https_proxy` 环境变量。
-- `proxy_connect_timeout` / `proxy_read_timeout`：经代理访问 Telegram 的连接/读取超时，默认各 20 秒。
-- `allowed_updates`：可选的 polling 更新类型覆盖；留空保持 python-telegram-bot 默认行为（默认会过滤 `chat_member`、`message_reaction` 和 `message_reaction_count`）。填写逗号/空格分隔的类型后只接收所列更新。
-- `max_restart`：外层 `run()` 异常的最大重试次数，默认 3。
-- `restart_delay`：重建前等待秒数。
-- `media_download_fallback`：媒体下载失败时是否保留消息并添加空占位，默认开启。
-- `rich_message_fallback`：是否从入站 `rich_message` 提取纯文本，默认开启。
-- `incompatible_versions`：需要跳过的版本列表，支持 `4.28`、`4.28.*` 等写法。
-
-### 代理地址怎么填
-
-| 部署方式 | 建议值 |
-|---|---|
-| Docker 容器访问宿主机 mihomo | `http://172.18.0.1:7890`（即容器网关） |
-| Docker 且用默认 docker0 网桥 | `http://172.17.0.1:7890` |
-| mihomo 与 AstrBot 同容器/同网络命名空间 | `http://127.0.0.1:7890` |
-
-> 注意：`172.18.0.1` 是 Docker compose 动态分配的网关。如果重建过网络（`docker compose down/up`），网段可能变成 `172.19.x`，此时代理会失效。建议在 mihomo 侧把 `bind-address` 改为 `0.0.0.0` 并配合防火墙，或在 compose 里固定 `subnet`。
-
-## 给其他插件注册 PTB handler
-
-其他插件可以直接导入本插件的公共 helper：
+其他插件可以使用公共 helper 注册 PTB handler：
 
 ```python
 from astrbot_plugin_tayhetgfix.main import register_telegram_handler
@@ -100,41 +86,17 @@ from telegram.ext import CallbackQueryHandler
 register_telegram_handler(CallbackQueryHandler(my_callback), group=120)
 ```
 
-注册表也会在内存中暴露为 `astrbot.core.platform.sources.telegram._cs_extra_handlers`，用于兼容原来依赖该名称的插件；它不是核心目录中的文件。
+注册表也会在内存中暴露为 `astrbot.core.platform.sources.telegram._cs_extra_handlers`，用于兼容依赖该名称的插件；这不是 AstrBot 核心目录中的文件。
 
-## 富文本说明
+## 限制与排障
 
-历史补丁里的富文本展平逻辑把 `heading.text` 假定为列表，并且没有处理表格 `cells`。本插件使用递归解析：
+- 媒体容错在核心转换失败后进行回退处理；如果 AstrBot 版本改变 converter 调用约定，插件可能因锚点检查失败而跳过，需要重新验证兼容性。
+- `max_restart` 只限制从核心 `run()` 冒泡到插件包装层的异常；AstrBot 核心已自行处理的轮询重试仍由核心负责。
+- 富文本 fallback 将内容提取为纯文本，不会把表格重新渲染成 AstrBot 组件。
+- 代理补丁只影响补丁生效后新创建的请求对象；修改代理后建议重启 AstrBot。
 
-- `text: "明日课表"`；
-- `blockquote.blocks` / `details.blocks`；
-- `table.cells`，输出为用 ` | ` 分隔的行；
-- 单元格中的 `{"text": {"type": "bold", "text": "..."}}`；
-- PTB 的 `to_dict()` 和 `api_kwargs` 两种字段位置。
+确认代理是否生效，可查看 mihomo 日志是否出现发往 Telegram 的连接，或在容器内检查新建的 `HTTPXRequest` 的代理配置。请勿在公开 issue 或日志中粘贴包含代理用户名、密码或 token 的配置。
 
-## 限制
+## 作者与许可证
 
-- 媒体容错采用“先调用原始 `convert_message`，失败后隐藏失败媒体字段重试，再补空组件”的包装方式，因此不替换核心整段逻辑；如果核心版本改变了 converter 的调用约定，锚点/冒烟测试需要重新确认。
-- `max_restart` 只限制从核心 `run()` 冒泡到插件包装层的异常；AstrBot 自身已经在核心内部处理的轮询重试仍由核心逻辑负责。
-- 富文本只提取为纯文本，不会把表格重新渲染为 AstrBot 组件。
-- 代理注入不处理 SOCKS5 的额外依赖；如需 `socks5://`，须在镜像内安装 `python-telegram-bot[socks]`。
-
-## 排障
-
-确认代理是否真的生效，在容器内执行：
-
-```bash
-docker exec astrbot python3 -c "
-from telegram.request import HTTPXRequest
-r = HTTPXRequest()
-print('proxy =', r._proxy_url if hasattr(r,'_proxy_url') else getattr(r,'proxy',None))
-"
-```
-
-更直接的验证是看 mihomo 日志里是否终于出现 telegram 流量：
-
-```bash
-journalctl -u mihomo -f | grep -i telegram
-```
-
-只要出现 `--> api.telegram.org:443 match Match using PROXY[...]`，就说明代理链路已打通。
+Copyright (C) 2026 tangshusheng。项目基于 [GNU Affero General Public License v3.0（AGPL-3.0）](LICENSE)授权。完整许可证文本见 [LICENSE](LICENSE)。

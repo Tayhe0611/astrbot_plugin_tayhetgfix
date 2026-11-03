@@ -9,6 +9,9 @@ _tgdiag_inspect/
 *.bak_*
 *.bak_v*
 
+# Generated release packages are distributed as GitHub release assets
+astrbot_plugin_tayhetgfix_v*.zip
+
 # Historical release archives are not source inputs
 astrbot_plugin_tg_hardening_v*.zip
 astrbot_plugin_tg_hardening_v*.tgz

@@ -31,9 +31,14 @@ from urllib.parse import urlsplit
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 
+if __package__:
+    from .watchdog import PollingWatchdog, settings_from_config
+else:  # Standalone smoke tests.
+    from watchdog import PollingWatchdog, settings_from_config
+
 
 PLUGIN_NAME = "astrbot_plugin_tayhetgfix"
-PLUGIN_VERSION = "1.2.4"
+PLUGIN_VERSION = "1.3.0"
 ADAPTER_MODULE = "astrbot.core.platform.sources.telegram.tg_adapter"
 TELEGRAM_PACKAGE = "astrbot.core.platform.sources.telegram"
 # None preserves PTB's upstream default (all allowed update types except
@@ -945,6 +950,9 @@ def _post_build_application(instance: Any) -> None:
     runtime = _runtime_for(instance)
     if not runtime.get("enabled", False):
         return
+    watchdog = runtime.get("watchdog")
+    if watchdog is not None:
+        watchdog.track(instance)
     module = runtime.get("adapter_module")
     package = runtime.get("telegram_package")
     if module is None or package is None:
@@ -969,8 +977,11 @@ async def _safe_rebuild(instance: Any) -> None:
                 result = shutdown()
             await _await_if_needed(result)
         except Exception as exc:
-            _logger_call("warning", "[tayhetgfix] 崩溃后关闭 Telegram application 失败: %s", exc)
+            _logger_call("warning", "[tayhetgfix] 崩溃后关闭 Telegram application 失败（%s），拒绝继续重建", type(exc).__name__)
+            raise
 
+    if getattr(instance, "_terminating", False):
+        return
     build = getattr(instance, "_build_application", None)
     if not callable(build):
         raise _PatchError("Telegram adapter no longer exposes _build_application")
@@ -978,15 +989,74 @@ async def _safe_rebuild(instance: Any) -> None:
     await _await_if_needed(result)
 
 
+def _make_shutdown_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original)
+    async def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        lock = getattr(self, "__tayhetgfix_shutdown_lock__", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(self, "__tayhetgfix_shutdown_lock__", lock)
+        async with lock:
+            setattr(self, "__tayhetgfix_shutdown_pending__", True)
+            application = getattr(self, "application", None)
+            updater = getattr(application, "updater", None)
+            # PTB can clear running before stop() has finished awaiting its task.
+            # Capture the task before core's suppress(Exception) can hide failure.
+            polling_task = getattr(updater, "_Updater__polling_task", None)
+            result = await original(self, *args, **kwargs)
+            if (getattr(application, "running", False)
+                    or getattr(updater, "running", False)
+                    or (isinstance(polling_task, asyncio.Future) and not polling_task.done())):
+                raise _PatchError("Telegram shutdown did not finish; refusing a second polling loop")
+            # Exceptions/cancellation intentionally leave pending=True (fail closed).
+            setattr(self, "__tayhetgfix_shutdown_pending__", False)
+            return result
+
+    setattr(wrapped, "__tg_hardening_wrapper__", True)
+    return wrapped
+
+
+def _make_polling_error_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original)
+    def wrapped(self: Any, error: Exception) -> Any:
+        manager = _runtime_for(self).get("watchdog")
+        if manager is not None and not manager.closed and manager.settings.enabled:
+            state = manager.states.get(id(self))
+            errors = importlib.import_module("telegram.error")
+            if state is not None and isinstance(error, getattr(errors, "NetworkError", ())):
+                # BadRequest inherits NetworkError too: passing it through would
+                # let the native counter restart despite the watchdog's block.
+                # Preserve a sanitized diagnostic without invoking that counter.
+                if isinstance(error, getattr(errors, "BadRequest", ())):
+                    _logger_call("error", "[tayhetgfix] Telegram polling 协议错误（%s），不请求重建", type(error).__name__)
+                return None
+        return original(self, error)
+
+    setattr(wrapped, "__tg_hardening_wrapper__", True)
+    return wrapped
+
+
 def _make_build_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(original)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if getattr(self, "_terminating", False):
+            return None
+        application = getattr(self, "application", None)
+        updater = getattr(application, "updater", None)
+        # Fail closed instead of starting a second poller when core shutdown
+        # swallowed a stop error, or was interrupted by platform termination.
+        if (getattr(self, "__tayhetgfix_shutdown_pending__", False)
+                or getattr(application, "running", False)
+                or getattr(updater, "running", False)):
+            raise _PatchError("refusing to rebuild Telegram while the old application may still be running")
         result = original(self, *args, **kwargs)
         # _build_application is synchronous in supported AstrBot versions.  If a
         # future version makes it async, leave its result untouched rather than
         # attempting to await from a sync wrapper.
         if inspect.isawaitable(result):
             return result
+        setattr(self, "__tayhetgfix_built_application__", getattr(self, "application", None))
+        setattr(self, "__tayhetgfix_built_callback__", getattr(type(self), "_on_polling_error", None))
         _post_build_application(self)
         return result
 
@@ -1149,7 +1219,10 @@ def _make_run_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(original)
     async def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         attempts = 0
+        _post_build_application(self)  # Also attaches to adapters created before plugin reload.
         while True:
+            if getattr(self, "_terminating", False):
+                return None
             try:
                 return await original(self, *args, **kwargs)
             except asyncio.CancelledError:
@@ -1181,8 +1254,9 @@ def _make_run_wrapper(original: Callable[..., Any]) -> Callable[..., Any]:
                         rebuild_exc,
                         exc_info=True,
                     )
-                    if attempts >= limit:
-                        raise
+                    # Never re-enter native run on an application whose shutdown
+                    # or rebuild could not be confirmed. Safety beats retry count.
+                    raise
                 delay = float(runtime.get("restart_delay", 1.0))
                 if delay:
                     await asyncio.sleep(delay)
@@ -1257,6 +1331,11 @@ def _unpatch_adapter(adapter_cls: type) -> bool:
     record = _record_for(adapter_cls)
     if not record:
         return False
+    runtime = record.get("runtime", {})
+    watchdog = runtime.get("watchdog")
+    if watchdog is not None:
+        watchdog.cancel()
+    runtime["enabled"] = False
     originals = record.get("originals", {})
     wrappers = record.get("wrappers", {})
     restored = False
@@ -1286,10 +1365,10 @@ def _unpatch_adapter(adapter_cls: type) -> bool:
 
 @register(
     PLUGIN_NAME,
-    "tangshusheng",
+    "Tayhe",
     "以可卸载、幂等的运行时补丁增强 AstrBot Telegram 适配器，避免直接修改核心文件。",
     PLUGIN_VERSION,
-    "https://github.com/tangshusheng/astrbot_plugin_tayhetgfix",
+    "https://github.com/Tayhe0611/astrbot_plugin_tayhetgfix",
 )
 class TelegramHardening(Star):
     def __init__(self, context: Context, config: Any = None):
@@ -1379,6 +1458,13 @@ class TelegramHardening(Star):
         }
 
         existing = _record_for(adapter_cls)
+        watchdog_settings = settings_from_config(self.config, _read_config, _as_bool)
+        old_watchdog = existing.get("runtime", {}).get("watchdog") if existing else None
+        if old_watchdog is not None:
+            old_watchdog.configure(watchdog_settings)
+            runtime["watchdog"] = old_watchdog
+        else:
+            runtime["watchdog"] = PollingWatchdog(watchdog_settings, _logger_call)
         if existing is not None:
             # A duplicate initialize must not wrap a wrapper again.  When the
             # plugin itself was hot-reloaded after a feature addition, remove
@@ -1394,6 +1480,8 @@ class TelegramHardening(Star):
                 )
                 and "send_rich_message" not in old_wrappers
             ):
+                needs_refresh = True
+            if existing.get("watchdog_revision") != 1:
                 needs_refresh = True
             if not needs_refresh:
                 _claim_package_registry(package, self._proxy_owner)
@@ -1417,11 +1505,13 @@ class TelegramHardening(Star):
                 setattr(adapter_cls, "__tayhetgfix_adapter_owner__", self._proxy_owner)
                 self._adapter_cls = adapter_cls
                 self.status = "already_applied"
+                self._attach_existing_platforms(adapter_cls)
                 _logger_call(
                     "info", "[tayhetgfix] 补丁已存在，刷新配置（version=%s）", self.version
                 )
                 return
             _unpatch_adapter(adapter_cls)
+            runtime["watchdog"] = PollingWatchdog(watchdog_settings, _logger_call)
 
         originals: dict[str, Any] = {
             "_build_application": getattr(adapter_cls, "_build_application"),
@@ -1440,6 +1530,15 @@ class TelegramHardening(Star):
             "run": _make_run_wrapper(originals["run"]),
             "message_handler": _make_message_wrapper(originals["message_handler"]),
         }
+
+        shutdown = getattr(adapter_cls, "_shutdown_application", None)
+        if inspect.iscoroutinefunction(shutdown):
+            originals["_shutdown_application"] = shutdown
+            wrappers["_shutdown_application"] = _make_shutdown_wrapper(shutdown)
+        polling_error = getattr(adapter_cls, "_on_polling_error", None)
+        if callable(polling_error) and not inspect.iscoroutinefunction(polling_error):
+            originals["_on_polling_error"] = polling_error
+            wrappers["_on_polling_error"] = _make_polling_error_wrapper(polling_error)
 
         # These are optional in older AstrBot versions.  The three core
         # hardening wrappers remain usable even when a revision has no
@@ -1464,7 +1563,7 @@ class TelegramHardening(Star):
                 "[tayhetgfix] 核心已提供 send_rich_message，保留核心实现",
             )
 
-        record = {"originals": originals, "wrappers": wrappers, "runtime": runtime}
+        record = {"originals": originals, "wrappers": wrappers, "runtime": runtime, "watchdog_revision": 1}
         try:
             for name, wrapper in wrappers.items():
                 setattr(adapter_cls, name, wrapper)
@@ -1502,6 +1601,7 @@ class TelegramHardening(Star):
         setattr(adapter_cls, "__tayhetgfix_adapter_owner__", self._proxy_owner)
         self._adapter_cls = adapter_cls
         self.status = "applied"
+        self._attach_existing_platforms(adapter_cls)
         _logger_call(
             "info",
             "[tayhetgfix] 补丁已应用（version=%s, allowed_updates=%s, max_restart=%d, proxy=%s）",
@@ -1510,6 +1610,31 @@ class TelegramHardening(Star):
             runtime["max_restart"],
             _proxy_log_target(proxy) if proxy else "直连",
         )
+
+    def _attach_existing_platforms(self, adapter_cls: type) -> None:
+        getter = getattr(self.context, "get_all_platforms", None)
+        if not callable(getter):
+            return
+        try:
+            for platform in getter():
+                if isinstance(platform, adapter_cls):
+                    _post_build_application(platform)
+                    manager = _runtime_for(platform).get("watchdog")
+                    application = getattr(platform, "application", None)
+                    updater = getattr(application, "updater", None)
+                    callback = getattr(type(platform), "_on_polling_error", None)
+                    if (manager is not None and id(platform) in manager.states
+                            and getattr(updater, "running", False)
+                            and (getattr(platform, "__tayhetgfix_built_application__", None) is not application
+                                 or getattr(platform, "__tayhetgfix_built_callback__", None) is not callback)):
+                        # PTB captures a bound error_callback in start_polling.
+                        # A class patch cannot replace the callback of a poller
+                        # already running before installation. Ask its owner to
+                        # rebuild once; never reach into PTB's private closure.
+                        manager.request_recovery(manager.states[id(platform)], asyncio.get_running_loop().time(),
+                                                 "接管已有轮询，需要更新错误回调")
+        except Exception as exc:
+            _logger_call("warning", "[tayhetgfix] 无法接入现有 Telegram 实例（%s），请重启平台/AstrBot", type(exc).__name__)
 
     def _deactivate(self) -> None:
         adapter_cls = self._adapter_cls
@@ -1531,7 +1656,14 @@ class TelegramHardening(Star):
             self._previous_package_registry = None
 
     async def terminate(self) -> None:
+        manager = None
+        if self._adapter_cls is not None and getattr(
+            self._adapter_cls, "__tayhetgfix_adapter_owner__", None
+        ) is self._proxy_owner:
+            manager = _runtime_for(self._adapter_cls).get("watchdog")
         self._deactivate()
+        if manager is not None:
+            await manager.close()
         self.status = "terminated"
         _logger_call("info", "[tayhetgfix] 已还原 Telegram 适配器补丁")
 

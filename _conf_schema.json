@@ -35,6 +35,36 @@
     "default": "",
     "hint": "逗号或空格分隔。留空时保留 python-telegram-bot 的默认行为；填写后仅接收列出的更新类型。"
   },
+  "watchdog_enabled": {
+    "description": "启用 Telegram 轮询掉线检测与自动恢复",
+    "type": "bool",
+    "default": true,
+    "hint": "观察真实 getUpdates 返回（含空结果），连续网络失败或长时间无成功轮询时请求 AstrBot 核心重建连接。不额外探测、不启动第二个轮询；需要核心支持原生恢复接口。"
+  },
+  "watchdog_interval": {
+    "description": "掉线检查间隔（秒）",
+    "type": "float",
+    "default": 15,
+    "hint": "每隔多久检查轮询状态，最小 1 秒；不会按此间隔发送额外 Telegram 请求。"
+  },
+  "watchdog_timeout": {
+    "description": "无成功轮询超时（秒）",
+    "type": "float",
+    "default": 120,
+    "hint": "最小 30 秒。超出时请求重建；也用作单次 getUpdates 等待预算，预算至少为 Telegram long-poll timeout + 30 秒。无用户新消息不算离线。"
+  },
+  "watchdog_failures": {
+    "description": "连续轮询网络失败次数",
+    "type": "int",
+    "default": 3,
+    "hint": "最小 1 次。一次成功 getUpdates（包括空轮询）即清零；达到次数或无成功轮询超时任一条件即可请求恢复。"
+  },
+  "watchdog_cooldown": {
+    "description": "两次看门狗恢复请求的最小间隔（秒）",
+    "type": "float",
+    "default": 120,
+    "hint": "最小 30 秒，重建 application 后仍保留冷却。持续代理故障时限制重复恢复；不限制 AstrBot 自行处理的其他崩溃重试。"
+  },
   "max_restart": {
     "description": "run 外层崩溃后的最大重启次数",
     "type": "int",
